@@ -179,6 +179,26 @@ tt.func public @rewrite_if(%arg0: !tt.ptr<f16>, %arg1: i1) -> tensor<128x32xf16>
 
 
 // -----
+// make_tensor_ptr in scf.if
+tt.func public @rewrite_if(%arg0: !tt.ptr<f16>, %arg1: !tt.ptr<f16>, %arg2: i1) -> tensor<128x32xf16> {
+  %c0_i32 = arith.constant 0 : i32
+  %c1_i64 = arith.constant 1 : i64
+  %c2_i64 = arith.constant 2 : i64
+  %c32_i64 = arith.constant 32 : i64
+  %c128_i64 = arith.constant 128 : i64
+  %cst = arith.constant dense<0x7E00> : tensor<128x32xf16>
+  %0 = scf.if %arg2 -> (!tt.ptr<tensor<128x32xf16>>) {
+    %1 = tt.make_tensor_ptr %arg0, [%c128_i64, %c32_i64], [%c1_i64, %c1_i64], [%c0_i32, %c0_i32] {order = array<i32: 1, 0>} : !tt.ptr<tensor<128x32xf16>>
+    scf.yield %1 : !tt.ptr<tensor<128x32xf16>>
+  } else {
+    %2 = tt.make_tensor_ptr %arg0, [%c128_i64, %c32_i64], [%c1_i64, %c2_i64], [%c0_i32, %c0_i32] {order = array<i32: 1, 0>} : !tt.ptr<tensor<128x32xf16>>
+    scf.yield %2 : !tt.ptr<tensor<128x32xf16>>
+  }
+  %3 = tt.load %0 {boundaryCheck = array<i32: 1>, padding = 2 : i32} : !tt.ptr<tensor<128x32xf16>>
+  tt.return %3 : tensor<128x32xf16>
+}
+
+// -----
 tt.func public @asm_in_loop(%arg0: !tt.ptr<bf16>) {
   %c0_i32 = arith.constant 0 : i32
   %c1_i32 = arith.constant 1 : i32

@@ -226,7 +226,7 @@ public:
 
   Operation *rewriteMakeTensorPtrOp(OpBuilder &builder,
                                     triton::MakeTensorPtrOp op,
-                                    std::stack<Operation *> &eraser) {
+                                    llvm::SetVector<Operation *> &eraser) {
     // Save info for later use
     auto ptrType = cast<triton::PointerType>(op.getType());
     auto tensorType = cast<RankedTensorType>(ptrType.getPointeeType());
@@ -245,12 +245,12 @@ public:
                      tensorType.getShape());
 
     // Erase the original operation
-    eraser.push(op);
+    eraser.insert(op);
     return nullptr;
   }
 
   Operation *rewriteAdvanceOp(OpBuilder &builder, triton::AdvanceOp op,
-                              std::stack<Operation *> &eraser) {
+                              llvm::SetVector<Operation *> &eraser) {
     // Get info from previous results
     assert(rewritedInfo.count(op.getPtr()));
     auto info = rewritedInfo[op.getPtr()];
@@ -271,12 +271,12 @@ public:
     rewritedInfo[op.getResult()] = info;
 
     // Erase the original operation
-    eraser.push(op);
+    eraser.insert(op);
     return nullptr;
   }
 
   Operation *rewriteLoadStoreOp(OpBuilder &builder, Operation *op,
-                                std::stack<Operation *> &eraser) {
+                                llvm::SetVector<Operation *> &eraser) {
     assert(isa<triton::LoadOp>(op) || isa<triton::StoreOp>(op));
 
     // We only have to rewrite load/stores with tensor pointers
@@ -321,12 +321,12 @@ public:
     }
 
     // Erase the original operation
-    eraser.push(op);
+    eraser.insert(op);
     return nullptr;
   }
 
   Operation *rewriteIfOp(OpBuilder &builder, scf::IfOp op,
-                         std::stack<Operation *> &eraser) {
+                         llvm::SetVector<Operation *> &eraser) {
     auto thenYieldOp = op.thenYield();
     assert(op.getNumResults() == thenYieldOp.getNumOperands());
     SmallVector<Value> results = thenYieldOp.getOperands();
@@ -387,12 +387,12 @@ public:
       }
     }
 
-    eraser.push(op);
+    eraser.insert(op);
     return newOp;
   }
 
   Operation *rewriteForOp(OpBuilder &builder, scf::ForOp op,
-                          std::stack<Operation *> &eraser) {
+                          llvm::SetVector<Operation *> &eraser) {
     // Generate new iteration operands and set rewrited information
     SmallVector<Value> oldIterOperands = llvm::to_vector(op.getInitArgs());
     SmallVector<Value> newIterOperands = llvm::to_vector(op.getInitArgs());
@@ -460,13 +460,14 @@ public:
     }
 
     // Erase later
-    eraser.push(op);
+    eraser.insert(op);
     return newForOp;
   }
 
   Operation *rewriteYieldOp(OpBuilder &builder, scf::YieldOp op,
-                            std::stack<Operation *> &eraser) {
+                            llvm::SetVector<Operation *> &eraser) {
     // Replace tensor pointers with offsets
+    op->getParentRegion()->getParentOp()->dump();
     SmallVector<Value> newOperands = op->getOperands();
     for (unsigned i = 0, size = op.getNumOperands(); i < size; ++i) {
       if (!triton::isTensorPointerType(newOperands[i].getType()))
@@ -484,7 +485,9 @@ public:
     return nullptr;
   }
 
-  Operation *rewriteOp(Operation *op, std::stack<Operation *> &eraser) {
+  Operation *rewriteOp(Operation *op, llvm::SetVector<Operation *> &eraser) {
+    if (eraser.contains(op))
+      return nullptr;
     OpBuilder builder(op);
 
     // Rewrite `make_tensor_ptr` and `advance` and make a tensor of pointers
@@ -519,7 +522,7 @@ public:
     return op;
   }
 
-  void visitOperation(Operation *op, std::stack<Operation *> &eraser) {
+  void visitOperation(Operation *op, llvm::SetVector<Operation *> &eraser) {
     for (Region &region : op->getRegions()) {
       for (Block &block : region) {
         for (Operation &nestedOp : llvm::make_early_inc_range(block)) {
@@ -543,15 +546,44 @@ public:
     // So here we recursively build the IR, to be specific, we have to rewrite
     // `tt.make_tensor_ptr`, `tt.advance`, `tt.load`, `tt.store`,
     // `scf.for` (tensor pointer usages may be in a loop fashion)
-    std::stack<Operation *> eraser;
-    visitOperation(getOperation(), eraser);
+    llvm::SetVector<Operation *> eraser;
+    auto root = getOperation();
+
+    // Since the subsequent `visitOperation` function traverses operations
+    // layer by layer, the value of a tensor pointer type may be produced by
+    // `tt.make_tensor_ptr` within the op’s region, as shown in the following
+    // IR:
+    // ```mlir
+    //   %0 = scf.if %bool -> (!tt.ptr<tensor<128x32xf16>>) {
+    //     %1 = tt.make_tensor_ptr ... : !tt.ptr<tensor<128x32xf16>>
+    //     scf.yield %1 : !tt.ptr<tensor<128x32xf16>>
+    //   } else {
+    //     %2 = tt.make_tensor_ptr ... : !tt.ptr<tensor<128x32xf16>>
+    //     scf.yield %2 : !tt.ptr<tensor<128x32xf16>>
+    //   }
+    // ```
+    // Therefore, we need to first collect all `rewritedInfo` provided by
+    // `tt.make_tensor_ptr` in the input IR.
+    OpBuilder builder(root);
+    SmallVector<Operation*, 4> worklist;
+    root->walk([&](triton::MakeTensorPtrOp makeTensorPtrOp) {
+      worklist.push_back(makeTensorPtrOp);
+    });
+    while (!worklist.empty()) {
+      Operation *candidant = worklist.pop_back_val();
+      rewriteOp(candidant, eraser);
+      for (auto userop : candidant->getUsers()) {
+        worklist.push_back(userop);
+      }
+    }
+
+    visitOperation(root, eraser);
 
     // The operation could not be erased during visit, because they may have
     // later usages, so we erase after visit
     rewritedInfo.clear();
     while (!eraser.empty()) {
-      auto op = eraser.top();
-      eraser.pop();
+      auto op = eraser.pop_back_val();
       op->erase();
     }
   }
